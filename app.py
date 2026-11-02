@@ -36,7 +36,13 @@ from pypdf import PdfReader        # reads .pdf files
 # ---------------------------------------------------------------------------
 GROQ_API_KEY_PLACEHOLDER = "PASTE_YOUR_GROQ_API_KEY_HERE"
 
-MODEL_NAME = "llama-3.3-70b-versatile"   # a strong, free-tier-friendly Groq model
+# Groq changes its model list from time to time. If you ever see a "model_not_found"
+# error, check https://console.groq.com/docs/models and update this list.
+# The app tries the models in order and uses the first one that works.
+MODEL_CANDIDATES = [
+    "openai/gpt-oss-120b",   # best quality
+    "openai/gpt-oss-20b",    # faster / lighter backup
+]
 MAX_CHARS_PER_DOC = 6000                 # limit text per document (keeps requests small)
 SUPPORTED_TYPES = ["pdf", "txt", "docx"]
 
@@ -175,24 +181,61 @@ Include a row for EVERY product for each important feature (use the same feature
 """
 
 
-def call_groq(api_key, prompt):
-    """Send the prompt to Groq and return the parsed JSON result."""
-    client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system",
-             "content": "You compare products strictly using provided documents and reply only with valid JSON."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,                              # low = more factual, less creative
-        response_format={"type": "json_object"},      # ask Groq for JSON output
-    )
-    raw_text = response.choices[0].message.content
+def is_model_missing_error(error):
+    """True if Groq says the model does not exist / is not available."""
+    text = str(error).lower()
+    return "model_not_found" in text or "does not exist" in text or "decommissioned" in text
 
-    # Safety: strip markdown fences if the model added them
-    cleaned = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    return json.loads(cleaned)
+
+def call_groq(api_key, prompt):
+    """
+    Send the prompt to Groq and return (parsed JSON result, model name used).
+    Tries each model in MODEL_CANDIDATES until one works.
+    """
+    client = Groq(api_key=api_key)
+    messages = [
+        {"role": "system",
+         "content": "You compare products strictly using provided documents and reply only with valid JSON."},
+        {"role": "user", "content": prompt},
+    ]
+
+    last_error = None
+    for model in MODEL_CANDIDATES:
+        try:
+            try:
+                # First try with JSON mode (forces valid JSON output)
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.2,                          # low = more factual
+                    response_format={"type": "json_object"},
+                )
+            except Exception as error:
+                if is_model_missing_error(error):
+                    raise                                     # handled by the outer except
+                # Some models may not support JSON mode - retry without it
+                response = client.chat.completions.create(
+                    model=model, messages=messages, temperature=0.2,
+                )
+
+            raw_text = response.choices[0].message.content or ""
+
+            # Safety: strip markdown fences if the model added them
+            cleaned = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            return json.loads(cleaned), model
+
+        except json.JSONDecodeError:
+            raise                                             # let the caller show a friendly message
+        except Exception as error:
+            last_error = error
+            if is_model_missing_error(error):
+                continue                                      # try the next model
+            raise                                             # other errors (bad key, rate limit...)
+
+    raise RuntimeError(
+        f"None of the models in MODEL_CANDIDATES are available ({last_error}). "
+        "Check https://console.groq.com/docs/models and update the list at the top of app.py."
+    )
 
 
 def show_list(items):
@@ -243,7 +286,7 @@ with st.sidebar:
             "Enter your Groq API key (temporary)", type="password",
             help="Better: add GROQ_API_KEY to .streamlit/secrets.toml or an environment variable.",
         )
-    st.caption(f"Model: `{MODEL_NAME}`")
+    st.caption("Models: " + ", ".join(f"`{m}`" for m in MODEL_CANDIDATES))
     st.markdown("---")
     st.markdown(
         "**How it works**\n"
@@ -316,7 +359,9 @@ if compare_clicked:
             try:
                 with st.spinner("AI is comparing the products..."):
                     prompt = build_prompt(documents, requirements)
-                    st.session_state["result"] = call_groq(api_key, prompt)
+                    result_data, used_model = call_groq(api_key, prompt)
+                    st.session_state["result"] = result_data
+                    st.session_state["model_used"] = used_model
             except json.JSONDecodeError:
                 st.error("The AI returned an unreadable answer. Please click Compare again.")
             except Exception as error:
@@ -384,5 +429,6 @@ if result:
         st.markdown("**⚠️ Information not available in the documents:**")
         show_list(missing)
 
+    st.caption(f"Model used: {st.session_state.get('model_used', 'unknown')}")
     st.caption("This recommendation is based only on the uploaded documents. "
                "Please double-check important details before buying.")
